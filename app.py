@@ -1,1072 +1,960 @@
-"""
-Draft Athletic Qualities Dashboard
-
-Streamlit app for ranking draft players from a Google Sheet with the same tabs as the
-provided workbook:
-  - Sprint
-  - Anthropometrics
-  - Force Plate
-
-Scoring philosophy
-------------------
-Athlete Score: current athletic qualities from CMJ + sprint outputs.
-  - Concentric Impulse
-  - mRSI / RSI-modified
-  - Sprint times
-
-Physical Potential Score: size + power/reactive qualities + speed.
-  - Height
-  - Bodyweight
-  - mRSI / RSI-modified
-  - Relative peak power
-  - Sprint times
-  - Pitchers only: wingspan / arm span included in potential
-
-The app uses percentile scoring so new draft classes can be added without hard-coded norms.
-Higher is always better after direction is handled; sprint times are inverted because faster
-means lower time.
-"""
-
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
+import gspread
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-import gspread
 from google.oauth2.service_account import Credentials
 
 
-# -----------------------------
-# Streamlit page setup
-# -----------------------------
+# ============================================================
+# Page setup
+# ============================================================
+
 st.set_page_config(
-    page_title="Draft Athletic Qualities",
+    page_title="Draft Athletic Dashboard",
     page_icon="⚾",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 APP_TITLE = "Draft Athletic Qualities + Physical Potential"
-REQUIRED_TABS = ["Sprint", "Anthropometrics", "Force Plate"]
 
+DEFAULT_GOOGLE_SHEET_ID = "1J27zw_UngoTNdq6VKPF6RhB8aqfmvlpX60GtrXjOsbs"
 
-# -----------------------------
-# Column aliasing
-# -----------------------------
-@dataclass(frozen=True)
-class MetricSpec:
-    canonical: str
-    aliases: Tuple[str, ...]
-    higher_is_better: bool = True
-
-
-METRIC_SPECS: Dict[str, MetricSpec] = {
-    "player_id": MetricSpec("player_id", ("DPL ID", "dpl id", "Player ID", "player_id", "ID")),
-    "name": MetricSpec("name", ("Full Name", "About", "Name", "Player", "Full Name Reverse", "full name reverse")),
-    "name_reverse": MetricSpec("name_reverse", ("Full Name Reverse", "full name reverse")),
-    "first_name": MetricSpec("first_name", ("First Name", "GivenName", "first_name")),
-    "last_name": MetricSpec("last_name", ("Last Name", "FamilyName", "last_name")),
-    "year": MetricSpec("year", ("Year", "year")),
-    "date": MetricSpec("date", ("Date", "date")),
-    "position": MetricSpec("position", ("Position", "position")),
-    "school": MetricSpec("school", ("School Name", "School", "school")),
-    "school_type": MetricSpec("school_type", ("School Type", "school_type")),
-    "bats": MetricSpec("bats", ("Bats", "bats")),
-    "throws": MetricSpec("throws", ("Throws", "throws")),
-    "height": MetricSpec(
-        "height",
-        (
-            "Height",
-            "Height 2",
-            "Stature Calc",
-            "Stature Height 1",
-            "Stature Height 2",
-            "Stature Height 3",
-        ),
-    ),
-    "bodyweight": MetricSpec(
-        "bodyweight",
-        (
-            "Body Weight (kg)",
-            "Body Weight [kg]",
-            "ForceDecks BW",
-            "Weight (kg)",
-            "Body Weight",
-            "Body Weight 2",
-            "Stature Body Weight 1",
-            "Stature Body Weight 2",
-            "Stature Body Weight 3",
-        ),
-    ),
-    "wingspan": MetricSpec(
-        "wingspan",
-        (
-            "Arm Span",
-            "Arm Span 2",
-            "Stature Arm Span 1",
-            "Stature Arm Span 2",
-            "Stature Arm Span 3",
-            "Wingspan",
-            "Wing Span",
-        ),
-    ),
-    "ci": MetricSpec(
-        "ci",
-        (
-            "Concentric Impulse [Ns]",
-            "Concentric Impulse [N s]",
-            "Concentric Impulse",
-            "Positive Impulse [Ns]",
-        ),
-    ),
-    "mrsi": MetricSpec(
-        "mrsi",
-        (
-            "RSI-Modified [m/s]",
-            "RSI-modified [m/s]",
-            "CMJ RSI-Modified [m/s]",
-            "Max RSI-Modified [m/s]",
-            "Mean RSI-Modified [m/s]",
-            "RSI-modified (Imp-Mom) [m/s]",
-            "mRSI",
-            "MRSI",
-        ),
-    ),
-    "rel_peak_power": MetricSpec(
-        "rel_peak_power",
-        (
-            "Peak Power / BM [W/kg]",
-            "Max Peak Power / BM [W/kg]",
-            "CMJ Max Peak Power BM wkg",
-            "CMJ Max Peak Power [W/kg]",
-            "Concentric Peak Power / BM [W/kg]",
-            "Takeoff Concentric Peak Power / BM [W/kg]",
-        ),
-    ),
-    "peak_power": MetricSpec(
-        "peak_power",
-        (
-            "Peak Power [W]",
-            "Max Peak Power [W]",
-            "CMJ Max Peak Power [W]",
-            "Concentric Peak Power [W]",
-        ),
-    ),
-    "sprint_10yd": MetricSpec("sprint_10yd", ("10yd", "10 yd", "10 Yard", "10-yard", "10 Yard Split"), False),
-    "sprint_20yd": MetricSpec("sprint_20yd", ("20yd", "20 yd", "20 Yard", "20-yard", "20 Yard Split"), False),
-    "sprint_30yd": MetricSpec("sprint_30yd", ("30yd", "30 yd", "30 Yard", "30-yard", "30 Yard Split"), False),
+REQUIRED_TABS = {
+    "Sprint": "Sprint",
+    "Anthropometrics": "Anthropometrics",
+    "Force Plate": "Force Plate",
 }
 
-PLAYER_ID_COL = "player_id"
+
+# ============================================================
+# Password gate
+# ============================================================
+
+def password_gate() -> None:
+    password = st.secrets.get("DASHBOARD_PASSWORD", None)
+
+    if not password:
+        return
+
+    if st.session_state.get("authenticated", False):
+        return
+
+    st.title("Draft Athletic Dashboard")
+    entered = st.text_input("Password", type="password")
+
+    if entered == password:
+        st.session_state["authenticated"] = True
+        st.rerun()
+
+    if entered:
+        st.error("Incorrect password.")
+
+    st.stop()
 
 
-# -----------------------------
-# Google Sheets connection
-# -----------------------------
-def _service_account_info_from_secrets() -> dict:
-    """Read service account JSON from Streamlit secrets.
+password_gate()
 
-    Supports either:
-      [gcp_service_account]
-      type = "service_account"
-      ...
 
-    or:
-      GOOGLE_SERVICE_ACCOUNT_JSON = "{...}"
+# ============================================================
+# Google Sheets helpers
+# ============================================================
+
+def get_sheet_id() -> str:
+    return st.secrets.get("GOOGLE_SHEET_ID", DEFAULT_GOOGLE_SHEET_ID)
+
+
+def get_google_credentials_dict() -> dict:
     """
-    if "gcp_service_account" in st.secrets:
-        return dict(st.secrets["gcp_service_account"])
+    Supports this Streamlit secrets format:
+
+    GOOGLE_CREDENTIALS = '''{
+      "type": "service_account",
+      ...
+    }'''
+
+    Also supports:
+    GOOGLE_SERVICE_ACCOUNT_JSON = '''{...}'''
+
+    Or:
+    [gcp_service_account]
+    type = "service_account"
+    ...
+    """
+    if "GOOGLE_CREDENTIALS" in st.secrets:
+        raw = st.secrets["GOOGLE_CREDENTIALS"]
+        return json.loads(raw) if isinstance(raw, str) else dict(raw)
 
     if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
         raw = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
         return json.loads(raw) if isinstance(raw, str) else dict(raw)
 
+    if "gcp_service_account" in st.secrets:
+        return dict(st.secrets["gcp_service_account"])
+
     raise RuntimeError(
-        "Missing Google credentials. Add a [gcp_service_account] block or "
-        "GOOGLE_SERVICE_ACCOUNT_JSON to .streamlit/secrets.toml / Streamlit Cloud secrets."
+        "Missing Google credentials. Add GOOGLE_CREDENTIALS, "
+        "GOOGLE_SERVICE_ACCOUNT_JSON, or [gcp_service_account] to Streamlit secrets."
     )
 
 
 @st.cache_resource(show_spinner=False)
-def get_gspread_client() -> gspread.Client:
+def get_gspread_client():
     scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
         "https://www.googleapis.com/auth/drive.readonly",
     ]
-    creds = Credentials.from_service_account_info(_service_account_info_from_secrets(), scopes=scopes)
+
+    creds_dict = get_google_credentials_dict()
+
+    creds = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=scopes,
+    )
+
     return gspread.authorize(creds)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_worksheet(sheet_id_or_url: str, worksheet_name: str) -> pd.DataFrame:
+def load_worksheet(sheet_id: str, worksheet_name: str) -> pd.DataFrame:
     client = get_gspread_client()
-    spreadsheet = client.open_by_url(sheet_id_or_url) if sheet_id_or_url.startswith("http") else client.open_by_key(sheet_id_or_url)
+    spreadsheet = client.open_by_key(sheet_id)
     worksheet = spreadsheet.worksheet(worksheet_name)
-    records = worksheet.get_all_records(empty2zero=False, head=1)
-    df = pd.DataFrame(records)
+    values = worksheet.get_all_records()
+
+    df = pd.DataFrame(values)
     df.columns = [str(c).strip() for c in df.columns]
     df = df.dropna(how="all")
-    df = df.loc[:, [c for c in df.columns if str(c).strip() != ""]]
+
     return df
 
 
-# -----------------------------
-# Data cleaning helpers
-# -----------------------------
-def find_first_existing_column(df: pd.DataFrame, aliases: Sequence[str]) -> Optional[str]:
-    exact = {str(c).strip(): c for c in df.columns}
-    lower = {str(c).strip().lower(): c for c in df.columns}
+# ============================================================
+# Column helpers
+# ============================================================
+
+COLUMN_ALIASES: Dict[str, List[str]] = {
+    "player_id": [
+        "DPL ID",
+        "dpl id",
+        "Player ID",
+        "player_id",
+        "ID",
+    ],
+    "name": [
+        "Full Name",
+        "Name",
+        "Player",
+        "About",
+        "Full Name Reverse",
+    ],
+    "first_name": [
+        "First Name",
+        "GivenName",
+    ],
+    "last_name": [
+        "Last Name",
+        "FamilyName",
+    ],
+    "position": [
+        "Position",
+        "position",
+        "POS",
+    ],
+    "school": [
+        "School Name",
+        "School",
+        "school",
+    ],
+    "year": [
+        "Year",
+        "year",
+        "Draft Year",
+    ],
+    "height": [
+        "Height",
+        "Height 2",
+        "Stature Calc",
+        "Stature Height 1",
+        "Stature Height 2",
+        "Stature Height 3",
+    ],
+    "bodyweight": [
+        "Body Weight (kg)",
+        "Body Weight [kg]",
+        "ForceDecks BW",
+        "Weight (kg)",
+        "Body Weight",
+        "Body Weight 2",
+        "Stature Body Weight 1",
+        "Stature Body Weight 2",
+        "Stature Body Weight 3",
+    ],
+    "wingspan": [
+        "Arm Span",
+        "Arm Span 2",
+        "Stature Arm Span 1",
+        "Stature Arm Span 2",
+        "Stature Arm Span 3",
+        "Wingspan",
+        "Wing Span",
+    ],
+    "ci": [
+        "Concentric Impulse [Ns]",
+        "Concentric Impulse [N s]",
+        "Concentric Impulse",
+        "Positive Impulse [Ns]",
+    ],
+    "mrsi": [
+        "RSI-Modified [m/s]",
+        "RSI-modified [m/s]",
+        "CMJ RSI-Modified [m/s]",
+        "Max RSI-Modified [m/s]",
+        "Mean RSI-Modified [m/s]",
+        "RSI-modified (Imp-Mom) [m/s]",
+        "mRSI",
+        "MRSI",
+    ],
+    "rel_peak_power": [
+        "Peak Power / BM [W/kg]",
+        "Max Peak Power / BM [W/kg]",
+        "CMJ Max Peak Power BM wkg",
+        "CMJ Max Peak Power [W/kg]",
+        "Concentric Peak Power / BM [W/kg]",
+        "Takeoff Concentric Peak Power / BM [W/kg]",
+    ],
+    "peak_power": [
+        "Peak Power [W]",
+        "Max Peak Power [W]",
+        "CMJ Max Peak Power [W]",
+        "Concentric Peak Power [W]",
+    ],
+    "sprint_10yd": [
+        "10yd",
+        "10 yd",
+        "10 Yard",
+        "10-yard",
+        "10 Yard Split",
+    ],
+    "sprint_20yd": [
+        "20yd",
+        "20 yd",
+        "20 Yard",
+        "20-yard",
+        "20 Yard Split",
+    ],
+    "sprint_30yd": [
+        "30yd",
+        "30 yd",
+        "30 Yard",
+        "30-yard",
+        "30 Yard Split",
+    ],
+}
+
+
+def find_column(df: pd.DataFrame, canonical_name: str) -> Optional[str]:
+    aliases = COLUMN_ALIASES.get(canonical_name, [])
+
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
 
     for alias in aliases:
-        if alias in exact:
-            return exact[alias]
-        if alias.lower() in lower:
-            return lower[alias.lower()]
+        key = alias.strip().lower()
+        if key in lower_map:
+            return lower_map[key]
 
-    # Fuzzy fallback for punctuation/spacing differences.
-    def norm(x: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", x.lower())
-
-    normalized_cols = {norm(str(c)): c for c in df.columns}
-    for alias in aliases:
-        key = norm(alias)
-        if key in normalized_cols:
-            return normalized_cols[key]
     return None
 
 
-def coalesce_columns(df: pd.DataFrame, aliases: Sequence[str]) -> pd.Series:
-    output = pd.Series(np.nan, index=df.index, dtype="object")
-    for alias in aliases:
-        col = find_first_existing_column(df, (alias,))
-        if col is not None:
-            output = output.where(output.notna() & (output.astype(str).str.strip() != ""), df[col])
-    return output
+def numeric_series(df: pd.DataFrame, canonical_name: str) -> pd.Series:
+    col = find_column(df, canonical_name)
+
+    if col is None:
+        return pd.Series(np.nan, index=df.index)
+
+    return pd.to_numeric(df[col], errors="coerce")
 
 
-def to_numeric(series: pd.Series) -> pd.Series:
-    if series is None:
-        return pd.Series(dtype="float64")
-    cleaned = (
-        series.astype(str)
-        .str.replace(",", "", regex=False)
-        .str.replace("%", "", regex=False)
-        .str.strip()
-        .replace({"": np.nan, "nan": np.nan, "None": np.nan})
-    )
-    return pd.to_numeric(cleaned, errors="coerce")
+def text_series(df: pd.DataFrame, canonical_name: str) -> pd.Series:
+    col = find_column(df, canonical_name)
+
+    if col is None:
+        return pd.Series("", index=df.index)
+
+    return df[col].astype(str).str.strip()
 
 
-def clean_id(series: pd.Series) -> pd.Series:
-    s = series.astype(str).str.strip()
-    s = s.str.replace(r"\.0$", "", regex=True)
-    s = s.replace({"": np.nan, "nan": np.nan, "None": np.nan})
-    return s
+def normalize_position(pos: object) -> str:
+    text = str(pos).strip().upper()
 
+    if text in ["RHP", "LHP", "P", "HP", "PITCHER"]:
+        return "P"
 
-def reverse_name_to_normal(name: object) -> object:
-    if pd.isna(name):
-        return np.nan
-    text = str(name).strip()
-    if not text:
-        return np.nan
-    pieces = text.split()
-    if len(pieces) == 2:
-        return f"{pieces[1]} {pieces[0]}"
+    if text in ["C", "1B", "2B", "3B", "SS", "OF", "CF", "LF", "RF"]:
+        return text
+
+    if "P" == text:
+        return "P"
+
     return text
 
 
-def normalize_height(value: object) -> float:
-    """Normalize height-like values to inches.
-
-    Handles:
-      - inches: 74, 74.5
-      - centimeters: 188, 188.5
-      - feet-inches strings: 6'2", 6-2
-    """
-    if pd.isna(value):
-        return np.nan
-    text = str(value).strip().lower().replace("\u2019", "'").replace("\u201d", '"')
-    if not text or text in {"nan", "none"}:
-        return np.nan
-
-    feet_in_match = re.match(r"^(\d+)\s*['-]\s*(\d+(?:\.\d+)?)", text)
-    if feet_in_match:
-        return float(feet_in_match.group(1)) * 12 + float(feet_in_match.group(2))
-
-    val = pd.to_numeric(text.replace("in", "").replace("cm", ""), errors="coerce")
-    if pd.isna(val):
-        return np.nan
-    val = float(val)
-    if val > 100:  # likely cm
-        return val / 2.54
-    return val
+def is_pitcher(pos: object) -> bool:
+    return normalize_position(pos) == "P"
 
 
-def normalize_bodyweight(value: object) -> float:
-    """Normalize bodyweight-like values to pounds.
+def make_name(df: pd.DataFrame) -> pd.Series:
+    name = text_series(df, "name")
 
-    Handles kg and pounds. Values under 140 are treated as kg for baseball populations.
-    """
-    val = pd.to_numeric(str(value).replace(",", "").strip(), errors="coerce")
-    if pd.isna(val):
-        return np.nan
-    val = float(val)
-    if val < 140:  # likely kg
-        return val * 2.2046226218
-    return val
+    if name.replace("", np.nan).notna().any():
+        return name
+
+    first = text_series(df, "first_name")
+    last = text_series(df, "last_name")
+    full = (first + " " + last).str.strip()
+
+    return full.replace("", "Unknown")
 
 
-def normalize_anthro_units(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for col in ["height", "wingspan"]:
-        if col in out.columns:
-            out[col] = out[col].apply(normalize_height)
-    if "bodyweight" in out.columns:
-        out["bodyweight"] = out["bodyweight"].apply(normalize_bodyweight)
+# ============================================================
+# Data prep
+# ============================================================
+
+def prep_anthro(df: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame()
+    out["player_id"] = text_series(df, "player_id")
+    out["name"] = make_name(df)
+    out["position"] = text_series(df, "position").map(normalize_position)
+    out["school"] = text_series(df, "school")
+    out["year"] = text_series(df, "year")
+    out["height"] = numeric_series(df, "height")
+    out["bodyweight"] = numeric_series(df, "bodyweight")
+    out["wingspan"] = numeric_series(df, "wingspan")
+
+    out = out[out["player_id"].astype(str).str.len() > 0]
+    out = out.drop_duplicates(subset=["player_id"], keep="last")
+
     return out
 
 
-def select_best_available_name(row: pd.Series) -> str:
-    for col in ["name", "name_from_reverse", "full_name_from_first_last", "name_reverse"]:
-        if col in row and pd.notna(row[col]) and str(row[col]).strip():
-            return str(row[col]).strip()
-    return str(row.get("player_id", "Unknown"))
+def prep_force_plate(df: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame()
+    out["player_id"] = text_series(df, "player_id")
+    out["ci"] = numeric_series(df, "ci")
+    out["mrsi"] = numeric_series(df, "mrsi")
+    out["rel_peak_power"] = numeric_series(df, "rel_peak_power")
+    out["peak_power"] = numeric_series(df, "peak_power")
+
+    out = out[out["player_id"].astype(str).str.len() > 0]
+
+    grouped = (
+        out.groupby("player_id", as_index=False)
+        .agg(
+            ci=("ci", "max"),
+            mrsi=("mrsi", "max"),
+            rel_peak_power=("rel_peak_power", "max"),
+            peak_power=("peak_power", "max"),
+        )
+    )
+
+    return grouped
 
 
-def canonicalize(df: pd.DataFrame, wanted: Sequence[str]) -> pd.DataFrame:
-    out = pd.DataFrame(index=df.index)
-    for key in wanted:
-        spec = METRIC_SPECS[key]
-        out[key] = coalesce_columns(df, spec.aliases)
+def prep_sprint(df: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame()
+    out["player_id"] = text_series(df, "player_id")
+    out["sprint_10yd"] = numeric_series(df, "sprint_10yd")
+    out["sprint_20yd"] = numeric_series(df, "sprint_20yd")
+    out["sprint_30yd"] = numeric_series(df, "sprint_30yd")
 
-    if "player_id" in out.columns:
-        out["player_id"] = clean_id(out["player_id"])
+    out = out[out["player_id"].astype(str).str.len() > 0]
 
-    # Build better display names when source has reverse/first/last columns.
-    if "name_reverse" in wanted or "name" in wanted:
-        reverse_source = coalesce_columns(df, METRIC_SPECS["name_reverse"].aliases)
-        out["name_from_reverse"] = reverse_source.apply(reverse_name_to_normal)
+    grouped = (
+        out.groupby("player_id", as_index=False)
+        .agg(
+            sprint_10yd=("sprint_10yd", "min"),
+            sprint_20yd=("sprint_20yd", "min"),
+            sprint_30yd=("sprint_30yd", "min"),
+        )
+    )
 
-    first = coalesce_columns(df, METRIC_SPECS["first_name"].aliases)
-    last = coalesce_columns(df, METRIC_SPECS["last_name"].aliases)
-    full = (first.fillna("").astype(str).str.strip() + " " + last.fillna("").astype(str).str.strip()).str.strip()
-    out["full_name_from_first_last"] = full.replace({"": np.nan})
-
-    numeric_cols = [
-        "year",
-        "height",
-        "bodyweight",
-        "wingspan",
-        "ci",
-        "mrsi",
-        "rel_peak_power",
-        "peak_power",
-        "sprint_10yd",
-        "sprint_20yd",
-        "sprint_30yd",
-    ]
-    for col in numeric_cols:
-        if col in out.columns:
-            out[col] = to_numeric(out[col])
-
-    if "date" in out.columns:
-        out["date"] = pd.to_datetime(out["date"], errors="coerce")
-
-    out = normalize_anthro_units(out)
-    return out
+    return grouped
 
 
-def aggregate_best_metrics(df: pd.DataFrame, group_col: str, metrics: Iterable[str]) -> pd.DataFrame:
-    agg = {m: "max" for m in metrics if m in df.columns}
-    if not agg:
-        return pd.DataFrame(columns=[group_col])
-    return df.groupby(group_col, dropna=False).agg(agg).reset_index()
+def combine_data(
+    anthro: pd.DataFrame,
+    force: pd.DataFrame,
+    sprint: pd.DataFrame,
+) -> pd.DataFrame:
+    df = anthro.merge(force, on="player_id", how="left")
+    df = df.merge(sprint, on="player_id", how="left")
+
+    sprint_cols = ["sprint_10yd", "sprint_20yd", "sprint_30yd"]
+
+    df["has_sprint"] = df[sprint_cols].notna().any(axis=1)
+    df["player_type"] = np.where(df["position"].map(is_pitcher), "Pitcher", "Position Player")
+
+    df["sprint_status"] = np.select(
+        [
+            df["player_type"].eq("Pitcher"),
+            df["has_sprint"].eq(True),
+            df["has_sprint"].eq(False),
+        ],
+        [
+            "Not expected for pitchers",
+            "Sprint data available",
+            "Missing / not tested",
+        ],
+        default="Unknown",
+    )
+
+    return df
 
 
-def aggregate_fastest_sprints(sprint: pd.DataFrame) -> pd.DataFrame:
-    metrics = ["sprint_10yd", "sprint_20yd", "sprint_30yd"]
-    existing = [m for m in metrics if m in sprint.columns]
-    if not existing:
-        return pd.DataFrame(columns=["player_id"])
-    return sprint.groupby("player_id", dropna=False)[existing].min().reset_index()
+# ============================================================
+# Scoring helpers
+# ============================================================
 
+def percentile_score(
+    values: pd.Series,
+    higher_is_better: bool = True,
+) -> pd.Series:
+    numeric = pd.to_numeric(values, errors="coerce")
 
-def aggregate_profile_fields(df: pd.DataFrame, fields: Iterable[str]) -> pd.DataFrame:
-    fields = [f for f in fields if f in df.columns]
-    if not fields:
-        return pd.DataFrame(columns=["player_id"])
+    if numeric.notna().sum() < 2:
+        return pd.Series(np.nan, index=values.index)
 
-    work = df.copy()
-    # Latest profile row if date exists; otherwise first non-empty values by player.
-    sort_cols = [c for c in ["date", "year"] if c in work.columns]
-    if sort_cols:
-        work = work.sort_values(sort_cols)
+    ranks = numeric.rank(pct=True, method="average") * 100
 
-    def last_valid(series: pd.Series):
-        s = series.dropna()
-        s = s[s.astype(str).str.strip() != ""]
-        return s.iloc[-1] if len(s) else np.nan
-
-    return work.groupby("player_id", dropna=False)[fields].agg(last_valid).reset_index()
-
-
-def percentile_score(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
-    if s.notna().sum() == 0:
-        return pd.Series(np.nan, index=s.index)
-    ranks = s.rank(pct=True, method="average") * 100
     if not higher_is_better:
         ranks = 101 - ranks
+
     return ranks.clip(0, 100)
 
 
-def weighted_mean(row: pd.Series, weights: Dict[str, float]) -> float:
-    present = {k: w for k, w in weights.items() if k in row.index and pd.notna(row[k])}
-    if not present:
+def weighted_score(
+    row: pd.Series,
+    metric_weights: Dict[str, float],
+) -> float:
+    available_scores = []
+    available_weights = []
+
+    for metric, weight in metric_weights.items():
+        value = row.get(metric)
+
+        if pd.notna(value):
+            available_scores.append(float(value))
+            available_weights.append(float(weight))
+
+    if len(available_scores) == 0:
         return np.nan
-    total_weight = sum(present.values())
-    return sum(row[k] * w for k, w in present.items()) / total_weight
+
+    total_weight = sum(available_weights)
+
+    if total_weight <= 0:
+        return np.nan
+
+    return float(np.average(available_scores, weights=available_weights))
 
 
-def is_pitcher_position(position: object) -> bool:
-    if pd.isna(position):
-        return False
-    text = str(position).lower()
-    pitcher_terms = ["pitcher", "rhp", "lhp", "starter", "reliever", "starting pitcher", "right handed pitcher", "left handed pitcher"]
-    return any(term in text for term in pitcher_terms)
+def sprint_composite_from_percentiles(df: pd.DataFrame) -> pd.Series:
+    sprint_percentile_cols = [
+        "sprint_10yd_pct",
+        "sprint_20yd_pct",
+        "sprint_30yd_pct",
+    ]
+
+    return df[sprint_percentile_cols].mean(axis=1, skipna=True)
 
 
-def normalize_position(position: object) -> str:
-    """Collapse messy baseball position strings into useful comparison groups."""
-    if pd.isna(position) or not str(position).strip():
-        return "Unknown"
-
-    text = str(position).strip().upper()
-    text = re.sub(r"[^A-Z0-9/ -]", "", text)
-
-    if is_pitcher_position(text):
-        return "Pitcher"
-    if any(token in text.split("/") for token in ["C", "CA", "CATCHER"]) or text in {"C", "CA", "CATCHER"}:
-        return "Catcher"
-    if "1B" in text or "FIRST" in text:
-        return "1B"
-    if "2B" in text or "SECOND" in text:
-        return "2B"
-    if "3B" in text or "THIRD" in text:
-        return "3B"
-    if "SS" in text or "SHORT" in text:
-        return "SS"
-    if any(x in text for x in ["OF", "CF", "LF", "RF", "OUTFIELD"]):
-        return "OF"
-    if "INF" in text or "IF" in text:
-        return "INF"
-    return str(position).strip()
-
-
-def comparison_group_for_row(row: pd.Series, position_player_comparison: str) -> str:
-    """Pitchers are always compared only to pitchers.
-
-    Position players can either be compared to all position players or to their
-    normalized position group, depending on the sidebar setting.
+def apply_group_percentiles(df: pd.DataFrame, comparison_mode: str) -> pd.DataFrame:
     """
-    if bool(row.get("is_pitcher", False)):
-        return "Pitchers"
-    if position_player_comparison == "Same position only":
-        pos = row.get("normalized_position", "Unknown")
-        return f"Position: {pos}"
-    return "All position players"
+    Pitchers are always compared only to pitchers.
 
+    Position players can be compared either to:
+      - all position players
+      - same position only
+    """
+    scored_parts = []
 
-def percentile_score_by_group(
-    df: pd.DataFrame,
-    value_col: str,
-    group_col: str = "comparison_group",
-    higher_is_better: bool = True,
-) -> pd.Series:
-    """Percentile score within each player's comparison group."""
-    if value_col not in df.columns or group_col not in df.columns:
-        return pd.Series(np.nan, index=df.index)
+    pitcher_df = df[df["player_type"] == "Pitcher"].copy()
+    pp_df = df[df["player_type"] == "Position Player"].copy()
 
-    out = pd.Series(np.nan, index=df.index, dtype="float64")
-    for _, idx in df.groupby(group_col, dropna=False).groups.items():
-        group_values = pd.to_numeric(df.loc[idx, value_col], errors="coerce")
-        out.loc[idx] = percentile_score(group_values, higher_is_better=higher_is_better)
-    return out
+    metric_directions = {
+        "ci": True,
+        "mrsi": True,
+        "rel_peak_power": True,
+        "peak_power": True,
+        "height": True,
+        "bodyweight": True,
+        "wingspan": True,
+        "sprint_10yd": False,
+        "sprint_20yd": False,
+        "sprint_30yd": False,
+    }
 
+    def score_within_group(group: pd.DataFrame) -> pd.DataFrame:
+        group = group.copy()
 
-def build_model(
-    sprint_df: pd.DataFrame,
-    anthro_df: pd.DataFrame,
-    force_df: pd.DataFrame,
-    position_player_comparison: str = "All position players",
-) -> pd.DataFrame:
-    sprint = canonicalize(sprint_df, ["player_id", "name", "name_reverse", "first_name", "last_name", "year", "sprint_10yd", "sprint_20yd", "sprint_30yd"])
-    anthro = canonicalize(
-        anthro_df,
-        [
-            "player_id",
-            "name",
-            "name_reverse",
-            "first_name",
-            "last_name",
-            "year",
-            "date",
-            "position",
-            "school_type",
-            "height",
-            "bodyweight",
-            "wingspan",
-            "bats",
-            "throws",
-        ],
-    )
-    force = canonicalize(
-        force_df,
-        [
-            "player_id",
-            "name",
-            "name_reverse",
-            "first_name",
-            "last_name",
-            "year",
-            "date",
-            "position",
-            "school",
-            "school_type",
-            "ci",
-            "mrsi",
-            "rel_peak_power",
-            "peak_power",
-            "bodyweight",
-        ],
-    )
-
-    for frame_name, frame in [("Sprint", sprint), ("Anthropometrics", anthro), ("Force Plate", force)]:
-        if "player_id" not in frame.columns or frame["player_id"].notna().sum() == 0:
-            st.warning(f"{frame_name} does not have a usable DPL ID/player ID column.")
-
-    sprint_best = aggregate_fastest_sprints(sprint.dropna(subset=["player_id"]))
-    anthro_profile = aggregate_profile_fields(
-        anthro.dropna(subset=["player_id"]),
-        ["name", "name_from_reverse", "full_name_from_first_last", "year", "position", "school_type", "height", "bodyweight", "wingspan", "bats", "throws"],
-    )
-    force_best = aggregate_best_metrics(
-        force.dropna(subset=["player_id"]),
-        "player_id",
-        ["ci", "mrsi", "rel_peak_power", "peak_power"],
-    )
-    force_profile = aggregate_profile_fields(
-        force.dropna(subset=["player_id"]),
-        ["name", "name_from_reverse", "full_name_from_first_last", "year", "position", "school", "school_type", "bodyweight"],
-    )
-
-    player_ids = pd.Series(
-        pd.concat(
-            [
-                sprint.get("player_id", pd.Series(dtype="object")),
-                anthro.get("player_id", pd.Series(dtype="object")),
-                force.get("player_id", pd.Series(dtype="object")),
-            ],
-            ignore_index=True,
-        ).dropna().unique(),
-        name="player_id",
-    )
-    model = pd.DataFrame({"player_id": player_ids})
-
-    for piece in [anthro_profile, force_profile.add_suffix("_force").rename(columns={"player_id_force": "player_id"}), force_best, sprint_best]:
-        if not piece.empty:
-            model = model.merge(piece, on="player_id", how="left")
-
-    # Coalesce duplicate profile fields from anthro and force.
-    for base in ["name", "name_from_reverse", "full_name_from_first_last", "year", "position", "school_type", "bodyweight"]:
-        force_col = f"{base}_force"
-        if force_col in model.columns:
-            if base in model.columns:
-                model[base] = model[base].where(model[base].notna() & (model[base].astype(str).str.strip() != ""), model[force_col])
-            else:
-                model[base] = model[force_col]
-
-    model["player_name"] = model.apply(select_best_available_name, axis=1)
-    model["is_pitcher"] = model.get("position", pd.Series(index=model.index, dtype="object")).apply(is_pitcher_position)
-    model["normalized_position"] = model.get("position", pd.Series(index=model.index, dtype="object")).apply(normalize_position)
-    model["comparison_group"] = model.apply(
-        lambda r: comparison_group_for_row(r, position_player_comparison), axis=1
-    )
-
-    # Sprint status is explicit because pitchers and some position players may not test sprint.
-    sprint_raw_cols = [c for c in ["sprint_10yd", "sprint_20yd", "sprint_30yd"] if c in model.columns]
-    if sprint_raw_cols:
-        model["has_sprint_data"] = model[sprint_raw_cols].notna().any(axis=1)
-    else:
-        model["has_sprint_data"] = False
-    model["sprint_data_status"] = np.select(
-        [model["has_sprint_data"], model["is_pitcher"]],
-        ["Available", "Not expected for pitchers"],
-        default="Missing / not tested",
-    )
-
-    # Sprint composite uses lower-is-better percentile scoring for each split, then averages
-    # available splits. Percentiles are calculated inside each player's comparison group.
-    for col in ["sprint_10yd", "sprint_20yd", "sprint_30yd"]:
-        if col in model.columns:
-            model[f"{col}_score"] = percentile_score_by_group(
-                model, col, group_col="comparison_group", higher_is_better=False
+        for metric, higher_is_better in metric_directions.items():
+            group[f"{metric}_pct"] = percentile_score(
+                group[metric],
+                higher_is_better=higher_is_better,
             )
-    sprint_score_cols = [c for c in ["sprint_10yd_score", "sprint_20yd_score", "sprint_30yd_score"] if c in model.columns]
-    model["sprint_score"] = model[sprint_score_cols].mean(axis=1, skipna=True) if sprint_score_cols else np.nan
 
-    # Component scores. Every percentile is calculated only against the applicable baseline:
-    # pitchers vs pitchers; position players vs all position players or same position.
-    score_specs = {
-        "ci_score": ("ci", True),
-        "mrsi_score": ("mrsi", True),
-        "rel_peak_power_score": ("rel_peak_power", True),
-        "height_score": ("height", True),
-        "bodyweight_score": ("bodyweight", True),
-        "wingspan_score": ("wingspan", True),
+        group["sprint_pct"] = sprint_composite_from_percentiles(group)
+
+        return group
+
+    if len(pitcher_df) > 0:
+        pitcher_scored = score_within_group(pitcher_df)
+        pitcher_scored["comparison_group"] = "Pitchers only"
+        scored_parts.append(pitcher_scored)
+
+    if len(pp_df) > 0:
+        if comparison_mode == "Same position only":
+            position_parts = []
+
+            for _, group in pp_df.groupby("position", dropna=False):
+                g = score_within_group(group)
+                g["comparison_group"] = "Same position only"
+                position_parts.append(g)
+
+            pp_scored = pd.concat(position_parts, ignore_index=True) if position_parts else pp_df
+
+        else:
+            pp_scored = score_within_group(pp_df)
+            pp_scored["comparison_group"] = "All position players"
+
+        scored_parts.append(pp_scored)
+
+    if not scored_parts:
+        return df
+
+    scored = pd.concat(scored_parts, ignore_index=True)
+
+    return scored
+
+
+def add_scores(df: pd.DataFrame, comparison_mode: str) -> pd.DataFrame:
+    df = apply_group_percentiles(df, comparison_mode=comparison_mode)
+
+    position_athlete_weights = {
+        "ci_pct": 0.40,
+        "mrsi_pct": 0.30,
+        "sprint_pct": 0.30,
     }
-    for score_col, (raw_col, hib) in score_specs.items():
-        model[score_col] = percentile_score_by_group(model, raw_col, "comparison_group", hib) if raw_col in model.columns else np.nan
 
-    # Missing sprint data is not scored as zero. weighted_mean automatically redistributes
-    # available weight across present components. Pitchers intentionally do not use sprint
-    # in either score because they generally will not sprint test in this workflow.
     pitcher_athlete_weights = {
-        "ci_score": 0.55,
-        "mrsi_score": 0.45,
+        "ci_pct": 0.55,
+        "mrsi_pct": 0.45,
     }
-    position_player_athlete_weights = {
-        "ci_score": 0.40,
-        "mrsi_score": 0.30,
-        "sprint_score": 0.30,
+
+    position_potential_weights = {
+        "height_pct": 0.20,
+        "bodyweight_pct": 0.15,
+        "mrsi_pct": 0.20,
+        "rel_peak_power_pct": 0.20,
+        "sprint_pct": 0.25,
     }
-    hitter_potential_weights = {
-        "height_score": 0.20,
-        "bodyweight_score": 0.15,
-        "mrsi_score": 0.20,
-        "rel_peak_power_score": 0.20,
-        "sprint_score": 0.25,
-    }
+
     pitcher_potential_weights = {
-        "height_score": 0.22,
-        "bodyweight_score": 0.15,
-        "wingspan_score": 0.25,
-        "mrsi_score": 0.20,
-        "rel_peak_power_score": 0.18,
+        "height_pct": 0.22,
+        "bodyweight_pct": 0.15,
+        "wingspan_pct": 0.25,
+        "mrsi_pct": 0.20,
+        "rel_peak_power_pct": 0.18,
     }
 
-    model["athlete_score"] = model.apply(
-        lambda r: weighted_mean(
-            r, pitcher_athlete_weights if r.get("is_pitcher", False) else position_player_athlete_weights
-        ),
-        axis=1,
-    )
-    model["potential_score"] = model.apply(
-        lambda r: weighted_mean(r, pitcher_potential_weights if r.get("is_pitcher", False) else hitter_potential_weights),
-        axis=1,
-    )
-    model["overall_score"] = model[["athlete_score", "potential_score"]].mean(axis=1, skipna=True)
+    athlete_scores = []
+    potential_scores = []
 
-    # Rank: 1 is best. These are ranks within the active comparison setup, not global raw values.
-    for score in ["overall_score", "athlete_score", "potential_score"]:
-        model[f"{score}_rank"] = model[score].rank(ascending=False, method="min")
+    for _, row in df.iterrows():
+        if row["player_type"] == "Pitcher":
+            athlete_scores.append(weighted_score(row, pitcher_athlete_weights))
+            potential_scores.append(weighted_score(row, pitcher_potential_weights))
+        else:
+            athlete_scores.append(weighted_score(row, position_athlete_weights))
+            potential_scores.append(weighted_score(row, position_potential_weights))
 
-    return model.sort_values(["overall_score", "athlete_score"], ascending=False).reset_index(drop=True)
+    df["athlete_score"] = athlete_scores
+    df["physical_potential_score"] = potential_scores
 
+    df["overall_score"] = df[["athlete_score", "physical_potential_score"]].mean(axis=1, skipna=True)
 
-def format_height(inches: object) -> str:
-    if pd.isna(inches):
-        return "—"
-    inches = float(inches)
-    ft = int(inches // 12)
-    inch = inches - ft * 12
-    return f"{ft}'{inch:.1f}\""
+    return df
 
 
-def coverage_table(model: pd.DataFrame) -> pd.DataFrame:
-    fields = {
-        "Concentric Impulse": "ci",
-        "mRSI": "mrsi",
-        "Relative Peak Power": "rel_peak_power",
-        "Sprint": "sprint_score",
-        "Height": "height",
-        "Bodyweight": "bodyweight",
-        "Wingspan": "wingspan",
-    }
-    rows = []
-    n = len(model)
-    for label, col in fields.items():
-        present = int(model[col].notna().sum()) if col in model.columns else 0
-        rows.append({"Metric": label, "Players With Data": present, "Coverage %": present / n * 100 if n else 0})
-    return pd.DataFrame(rows)
+def grade_from_score(score: float) -> str:
+    if pd.isna(score):
+        return "Incomplete"
+
+    if score >= 90:
+        return "Elite"
+    if score >= 75:
+        return "Plus"
+    if score >= 60:
+        return "Above Avg"
+    if score >= 45:
+        return "Average"
+    if score >= 30:
+        return "Below Avg"
+
+    return "Low"
 
 
-def display_metric(label: str, value: object, suffix: str = "", digits: int = 1):
-    if pd.isna(value):
-        st.metric(label, "—")
-    else:
-        st.metric(label, f"{float(value):.{digits}f}{suffix}")
+def add_labels(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    df["athlete_grade"] = df["athlete_score"].map(grade_from_score)
+    df["potential_grade"] = df["physical_potential_score"].map(grade_from_score)
+    df["overall_grade"] = df["overall_score"].map(grade_from_score)
+
+    return df
 
 
-# -----------------------------
-# UI
-# -----------------------------
+# ============================================================
+# Formatting helpers
+# ============================================================
+
+def round_display(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+
+    for col in numeric_cols:
+        df[col] = df[col].round(2)
+
+    return df
+
+
+def safe_multiselect(label: str, options: List[str], default: Optional[List[str]] = None):
+    clean_options = sorted([x for x in options if str(x).strip() != ""])
+
+    if default is None:
+        default = clean_options
+
+    return st.sidebar.multiselect(label, clean_options, default=default)
+
+
+# ============================================================
+# App body
+# ============================================================
+
 st.title(APP_TITLE)
-st.caption("Live draft dashboard powered by Google Sheets tabs matching the original workbook.")
+st.caption("Google Sheets-powered draft athletic qualities and physical potential dashboard.")
 
-with st.sidebar:
-    st.header("Google Sheet")
-    default_sheet = st.secrets.get("GOOGLE_SHEET_ID", "") if hasattr(st, "secrets") else ""
-    sheet_id_or_url = st.text_input(
-        "Sheet ID or URL",
-        value=default_sheet,
-        placeholder="Paste Google Sheet URL or ID",
-        help="The Google Sheet must contain Sprint, Anthropometrics, and Force Plate tabs.",
-    )
+sheet_id = get_sheet_id()
 
-    st.divider()
-    st.header("Comparison Baseline")
-    position_player_comparison = st.radio(
-        "Position player percentiles",
-        ["All position players", "Same position only"],
-        index=0,
-        help="Pitchers are always compared only to other pitchers. This setting only changes position-player baselines.",
-    )
+with st.spinner("Loading Google Sheet..."):
+    try:
+        sprint_raw = load_worksheet(sheet_id, REQUIRED_TABS["Sprint"])
+        anthro_raw = load_worksheet(sheet_id, REQUIRED_TABS["Anthropometrics"])
+        force_raw = load_worksheet(sheet_id, REQUIRED_TABS["Force Plate"])
+    except Exception as e:
+        st.error("Could not load the Google Sheet.")
+        st.exception(e)
+        st.stop()
 
-    st.divider()
-    st.header("Filters")
-    year_filter_enabled = st.checkbox("Use year filter", value=False)
-    min_data_points = st.slider("Minimum available score components", 1, 7, 2)
 
-    st.divider()
-    if st.button("Refresh Google Sheet data", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
+# Sidebar
+st.sidebar.header("Settings")
 
-if not sheet_id_or_url:
-    st.info("Paste your Google Sheet ID/URL in the sidebar, or add GOOGLE_SHEET_ID to Streamlit secrets.")
-    st.stop()
-
-try:
-    with st.spinner("Loading Google Sheet tabs…"):
-        sprint_raw = load_worksheet(sheet_id_or_url, "Sprint")
-        anthro_raw = load_worksheet(sheet_id_or_url, "Anthropometrics")
-        force_raw = load_worksheet(sheet_id_or_url, "Force Plate")
-except Exception as exc:
-    st.error("Could not load the Google Sheet.")
-    st.exception(exc)
-    st.stop()
-
-model = build_model(sprint_raw, anthro_raw, force_raw, position_player_comparison)
-
-if model.empty:
-    st.warning("No players were found after joining the source tabs by DPL ID.")
-    st.stop()
-
-# Apply optional year filter after model build.
-if year_filter_enabled and "year" in model.columns and model["year"].notna().any():
-    years = sorted([int(y) for y in pd.to_numeric(model["year"], errors="coerce").dropna().unique()])
-    selected_years = st.sidebar.multiselect("Years", years, default=years)
-    model = model[pd.to_numeric(model["year"], errors="coerce").isin(selected_years)]
-
-score_component_cols = ["ci_score", "mrsi_score", "rel_peak_power_score", "sprint_score", "height_score", "bodyweight_score", "wingspan_score"]
-model["available_score_components"] = model[[c for c in score_component_cols if c in model.columns]].notna().sum(axis=1)
-model = model[model["available_score_components"] >= min_data_points].copy()
-
-# Sidebar position filters depend on model values.
-with st.sidebar:
-    positions = sorted([p for p in model.get("position", pd.Series(dtype="object")).dropna().astype(str).unique() if p.strip()])
-    selected_positions = st.multiselect("Positions", positions, default=[])
-    only_pitchers = st.checkbox("Pitchers only", value=False)
-    search = st.text_input("Search player", value="")
-
-if selected_positions:
-    model = model[model["position"].astype(str).isin(selected_positions)]
-if only_pitchers:
-    model = model[model["is_pitcher"]]
-if search.strip():
-    model = model[model["player_name"].str.contains(search.strip(), case=False, na=False)]
-
-# KPI row.
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Players", f"{len(model):,}")
-col2.metric("Median Athlete Score", "—" if model["athlete_score"].dropna().empty else f"{model['athlete_score'].median():.1f}")
-col3.metric("Median Potential Score", "—" if model["potential_score"].dropna().empty else f"{model['potential_score'].median():.1f}")
-col4.metric("Pitchers", f"{int(model['is_pitcher'].sum()):,}")
-
-# Main tabs.
-rankings_tab, player_tab, visuals_tab, coverage_tab, raw_tab, methods_tab = st.tabs(
-    ["Rankings", "Player Detail", "Visuals", "Data Coverage", "Raw Sheets", "Methods"]
+comparison_mode = st.sidebar.radio(
+    "Position player comparison baseline",
+    options=[
+        "All position players",
+        "Same position only",
+    ],
+    index=0,
+    help="Pitchers are always compared only to other pitchers.",
 )
 
-with rankings_tab:
-    st.subheader("Draft Board")
-    display_cols = [
-        "overall_score_rank",
-        "player_name",
-        "player_id",
-        "year",
+st.sidebar.markdown("---")
+st.sidebar.caption(f"Google Sheet ID: `{sheet_id}`")
+
+
+# Process data
+anthro = prep_anthro(anthro_raw)
+force = prep_force_plate(force_raw)
+sprint = prep_sprint(sprint_raw)
+
+df = combine_data(anthro, force, sprint)
+df = add_scores(df, comparison_mode=comparison_mode)
+df = add_labels(df)
+
+
+# Sidebar filters
+positions = safe_multiselect(
+    "Positions",
+    options=df["position"].dropna().astype(str).unique().tolist(),
+)
+
+player_types = safe_multiselect(
+    "Player type",
+    options=df["player_type"].dropna().astype(str).unique().tolist(),
+)
+
+search = st.sidebar.text_input("Search player", value="").strip().lower()
+
+filtered = df.copy()
+
+if positions:
+    filtered = filtered[filtered["position"].isin(positions)]
+
+if player_types:
+    filtered = filtered[filtered["player_type"].isin(player_types)]
+
+if search:
+    filtered = filtered[
+        filtered["name"].astype(str).str.lower().str.contains(search, na=False)
+        | filtered["player_id"].astype(str).str.lower().str.contains(search, na=False)
+        | filtered["school"].astype(str).str.lower().str.contains(search, na=False)
+    ]
+
+
+# KPIs
+c1, c2, c3, c4 = st.columns(4)
+
+c1.metric("Players", f"{len(filtered):,}")
+c2.metric("Pitchers", f"{(filtered['player_type'] == 'Pitcher').sum():,}")
+c3.metric("Position Players", f"{(filtered['player_type'] == 'Position Player').sum():,}")
+c4.metric("Players with Sprint", f"{filtered['has_sprint'].sum():,}")
+
+
+# Tabs
+tab_rankings, tab_player, tab_charts, tab_data = st.tabs(
+    [
+        "Rankings",
+        "Player Profile",
+        "Charts",
+        "Raw Data",
+    ]
+)
+
+
+with tab_rankings:
+    st.subheader("Draft Rankings")
+
+    ranking_cols = [
+        "name",
         "position",
-        "normalized_position",
+        "school",
+        "player_type",
         "comparison_group",
-        "school_type",
-        "overall_score",
+        "sprint_status",
         "athlete_score",
-        "potential_score",
+        "athlete_grade",
+        "physical_potential_score",
+        "potential_grade",
+        "overall_score",
+        "overall_grade",
         "ci",
         "mrsi",
         "rel_peak_power",
-        "sprint_10yd",
-        "sprint_20yd",
-        "sprint_30yd",
-        "sprint_data_status",
         "height",
         "bodyweight",
         "wingspan",
-        "available_score_components",
+        "sprint_10yd",
+        "sprint_20yd",
+        "sprint_30yd",
     ]
-    existing_display_cols = [c for c in display_cols if c in model.columns]
-    table = model[existing_display_cols].copy()
-    rename_map = {
-        "overall_score_rank": "Rank",
-        "player_name": "Player",
-        "player_id": "DPL ID",
-        "year": "Year",
-        "position": "Position",
-        "normalized_position": "Position Group",
-        "comparison_group": "Comparison Group",
-        "school_type": "School Type",
-        "overall_score": "Overall",
-        "athlete_score": "Athlete Score",
-        "potential_score": "Potential",
-        "ci": "Concentric Impulse",
-        "mrsi": "mRSI",
-        "rel_peak_power": "Rel Peak Power",
-        "sprint_10yd": "10yd",
-        "sprint_20yd": "20yd",
-        "sprint_30yd": "30yd",
-        "sprint_data_status": "Sprint Status",
-        "height": "Height (in)",
-        "bodyweight": "Bodyweight (lb)",
-        "wingspan": "Wingspan (in)",
-        "available_score_components": "Data Components",
-    }
-    table = table.rename(columns=rename_map)
+
+    available_ranking_cols = [c for c in ranking_cols if c in filtered.columns]
+
+    ranking_df = (
+        filtered[available_ranking_cols]
+        .sort_values("overall_score", ascending=False, na_position="last")
+        .reset_index(drop=True)
+    )
+
     st.dataframe(
-        table,
+        round_display(ranking_df),
         use_container_width=True,
         hide_index=True,
-        column_config={
-            "Rank": st.column_config.NumberColumn(format="%d"),
-            "Overall": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
-            "Athlete Score": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
-            "Potential": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
-            "Concentric Impulse": st.column_config.NumberColumn(format="%.1f"),
-            "mRSI": st.column_config.NumberColumn(format="%.2f"),
-            "Rel Peak Power": st.column_config.NumberColumn(format="%.1f"),
-            "10yd": st.column_config.NumberColumn(format="%.3f"),
-            "20yd": st.column_config.NumberColumn(format="%.3f"),
-            "30yd": st.column_config.NumberColumn(format="%.3f"),
-            "Height (in)": st.column_config.NumberColumn(format="%.1f"),
-            "Bodyweight (lb)": st.column_config.NumberColumn(format="%.1f"),
-            "Wingspan (in)": st.column_config.NumberColumn(format="%.1f"),
-        },
     )
 
-    csv = table.to_csv(index=False).encode("utf-8")
-    st.download_button("Download current board as CSV", csv, "draft_athletic_board.csv", "text/csv")
+    csv = ranking_df.to_csv(index=False).encode("utf-8")
 
-with player_tab:
-    st.subheader("Player Detail")
-    players = model["player_name"].fillna(model["player_id"]).tolist()
-    selected_player = st.selectbox("Select player", players)
-    player = model.loc[model["player_name"].eq(selected_player)].iloc[0]
-
-    top_cols = st.columns(3)
-    with top_cols[0]:
-        display_metric("Overall", player.get("overall_score"))
-    with top_cols[1]:
-        display_metric("Athlete Score", player.get("athlete_score"))
-    with top_cols[2]:
-        display_metric("Physical Potential", player.get("potential_score"))
-
-    st.markdown(
-        f"**Position:** {player.get('position', '—')}  \n"
-        f"**DPL ID:** {player.get('player_id', '—')}  \n"
-        f"**School Type:** {player.get('school_type', '—')}  \n"
-        f"**Comparison Group:** {player.get('comparison_group', '—')}  \n"
-        f"**Sprint Status:** {player.get('sprint_data_status', '—')}  \n"
-        f"**Pitcher model:** {'Yes' if bool(player.get('is_pitcher', False)) else 'No'}"
+    st.download_button(
+        "Download filtered rankings CSV",
+        data=csv,
+        file_name="draft_athletic_rankings.csv",
+        mime="text/csv",
     )
 
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        display_metric("Concentric Impulse", player.get("ci"), digits=1)
-        display_metric("mRSI", player.get("mrsi"), digits=2)
-    with m2:
-        display_metric("Relative Peak Power", player.get("rel_peak_power"), " W/kg", digits=1)
-        display_metric("Bodyweight", player.get("bodyweight"), " lb", digits=1)
-    with m3:
-        st.metric("Height", format_height(player.get("height")))
-        st.metric("Wingspan", format_height(player.get("wingspan")))
-    with m4:
-        display_metric("10yd", player.get("sprint_10yd"), " s", digits=3)
-        display_metric("30yd", player.get("sprint_30yd"), " s", digits=3)
 
-    component_cols = [
-        "ci_score",
-        "mrsi_score",
-        "sprint_score",
-        "height_score",
-        "bodyweight_score",
-        "rel_peak_power_score",
-        "wingspan_score",
-    ]
-    component_labels = {
-        "ci_score": "Concentric Impulse",
-        "mrsi_score": "mRSI",
-        "sprint_score": "Sprint Composite",
-        "height_score": "Height",
-        "bodyweight_score": "Bodyweight",
-        "rel_peak_power_score": "Relative Peak Power",
-        "wingspan_score": "Wingspan",
-    }
-    comp = pd.DataFrame(
-        {
-            "Component": [component_labels[c] for c in component_cols if c in model.columns],
-            "Percentile Score": [player.get(c) for c in component_cols if c in model.columns],
-        }
-    ).dropna()
-    if not comp.empty:
-        fig = px.bar(comp, x="Component", y="Percentile Score", range_y=[0, 100], text="Percentile Score")
-        fig.update_traces(texttemplate="%{text:.0f}", textposition="outside")
-        fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+with tab_player:
+    st.subheader("Player Profile")
 
-with visuals_tab:
-    st.subheader("Score Map")
-    plot_df = model.dropna(subset=["athlete_score", "potential_score"]).copy()
-    if plot_df.empty:
-        st.info("Need athlete and potential scores to draw the map.")
+    player_options = (
+        filtered.sort_values("overall_score", ascending=False, na_position="last")["name"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+    if not player_options:
+        st.info("No players match the current filters.")
     else:
-        fig = px.scatter(
-            plot_df,
-            x="athlete_score",
-            y="potential_score",
-            color="is_pitcher",
-            size="overall_score",
-            hover_name="player_name",
-            hover_data=["position", "ci", "mrsi", "rel_peak_power", "sprint_30yd", "height", "bodyweight", "wingspan"],
-            labels={"athlete_score": "Athlete Score", "potential_score": "Physical Potential", "is_pitcher": "Pitcher"},
-            range_x=[0, 100],
-            range_y=[0, 100],
-        )
-        fig.update_layout(height=600, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        selected_player = st.selectbox("Select player", player_options)
 
-    st.subheader("Metric Relationships")
-    x_metric = st.selectbox("X-axis", ["ci", "mrsi", "rel_peak_power", "sprint_30yd", "height", "bodyweight", "wingspan"], index=0)
-    y_metric = st.selectbox("Y-axis", ["athlete_score", "potential_score", "overall_score", "sprint_score"], index=1)
-    rel_df = model.dropna(subset=[x_metric, y_metric]).copy()
-    if not rel_df.empty:
-        fig2 = px.scatter(
-            rel_df,
-            x=x_metric,
-            y=y_metric,
-            color="position",
-            hover_name="player_name",
-            trendline="ols" if len(rel_df) >= 8 else None,
-        )
-        fig2.update_layout(height=500, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig2, use_container_width=True)
-    else:
-        st.info("Not enough data for that metric relationship.")
+        player = filtered[filtered["name"] == selected_player].iloc[0]
 
-with coverage_tab:
-    st.subheader("Data Coverage")
-    cov = coverage_table(model)
-    st.dataframe(
-        cov,
-        use_container_width=True,
-        hide_index=True,
-        column_config={"Coverage %": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100)},
-    )
+        c1, c2, c3 = st.columns(3)
 
-    missing_view = model[
-        [
-            "player_name",
+        c1.metric("Athlete Score", f"{player['athlete_score']:.1f}" if pd.notna(player["athlete_score"]) else "NA")
+        c2.metric("Physical Potential", f"{player['physical_potential_score']:.1f}" if pd.notna(player["physical_potential_score"]) else "NA")
+        c3.metric("Overall", f"{player['overall_score']:.1f}" if pd.notna(player["overall_score"]) else "NA")
+
+        st.markdown("### Player Info")
+
+        info_cols = [
+            "name",
             "player_id",
             "position",
+            "school",
+            "player_type",
             "comparison_group",
-            "sprint_data_status",
-            "ci",
-            "mrsi",
-            "rel_peak_power",
-            "sprint_10yd",
-            "sprint_20yd",
-            "sprint_30yd",
-            "height",
-            "bodyweight",
-            "wingspan",
-            "available_score_components",
+            "sprint_status",
         ]
-    ].sort_values("available_score_components")
-    st.caption("Players with fewer available components are the first ones to clean up in the Google Sheet.")
-    st.dataframe(missing_view, use_container_width=True, hide_index=True)
 
-with raw_tab:
-    st.subheader("Raw Google Sheet Tabs")
-    st.caption("These are read-only previews. Edit the connected Google Sheet, then click Refresh.")
-    raw_choice = st.radio("Tab", REQUIRED_TABS, horizontal=True)
-    raw_map = {"Sprint": sprint_raw, "Anthropometrics": anthro_raw, "Force Plate": force_raw}
-    st.dataframe(raw_map[raw_choice].head(500), use_container_width=True, hide_index=True)
+        st.dataframe(
+            round_display(pd.DataFrame([player[info_cols]])),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-with methods_tab:
-    st.subheader("Scoring Method")
-    st.markdown(
-        """
-**Join key:** all tabs are joined by `DPL ID`.
+        st.markdown("### Athletic Profile")
 
-**Comparison baseline:** pitchers are always percentile-ranked only against other pitchers. Position players can be ranked against either all position players or only their normalized position group from the sidebar.
+        profile_cols = [
+            "ci",
+            "ci_pct",
+            "mrsi",
+            "mrsi_pct",
+            "rel_peak_power",
+            "rel_peak_power_pct",
+            "height",
+            "height_pct",
+            "bodyweight",
+            "bodyweight_pct",
+            "wingspan",
+            "wingspan_pct",
+            "sprint_10yd",
+            "sprint_10yd_pct",
+            "sprint_20yd",
+            "sprint_20yd_pct",
+            "sprint_30yd",
+            "sprint_30yd_pct",
+            "sprint_pct",
+        ]
 
-**Position player Athlete Score** estimates current athletic qualities:
+        profile_cols = [c for c in profile_cols if c in filtered.columns]
 
-- Concentric impulse percentile: 40%
-- mRSI / RSI-modified percentile: 30%
-- Sprint composite percentile: 30%
+        profile_table = pd.DataFrame(
+            {
+                "Metric": profile_cols,
+                "Value": [player[c] for c in profile_cols],
+            }
+        )
 
-**Pitcher Athlete Score** removes sprint because pitchers are generally not sprint-tested in this workflow:
+        st.dataframe(
+            round_display(profile_table),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-- Concentric impulse percentile: 55%
-- mRSI / RSI-modified percentile: 45%
 
-**Position player Physical Potential Score** estimates size/speed/power upside:
+with tab_charts:
+    st.subheader("Score Visuals")
 
-- Height percentile: 20%
-- Bodyweight percentile: 15%
-- mRSI percentile: 20%
-- Relative peak power percentile: 20%
-- Sprint composite percentile: 25%
+    chart_df = filtered.copy()
 
-**Pitcher Physical Potential Score** adds wingspan/arm span and does not require sprint:
+    chart_df = chart_df[
+        chart_df["athlete_score"].notna()
+        & chart_df["physical_potential_score"].notna()
+    ]
 
-- Height percentile: 22%
-- Bodyweight percentile: 15%
-- Wingspan percentile: 25%
-- mRSI percentile: 20%
-- Relative peak power percentile: 18%
+    if len(chart_df) == 0:
+        st.info("Not enough scored players to chart.")
+    else:
+        fig = px.scatter(
+            chart_df,
+            x="athlete_score",
+            y="physical_potential_score",
+            color="position",
+            hover_name="name",
+            hover_data=[
+                "school",
+                "player_type",
+                "comparison_group",
+                "sprint_status",
+                "ci",
+                "mrsi",
+                "rel_peak_power",
+                "height",
+                "bodyweight",
+                "wingspan",
+                "sprint_10yd",
+                "sprint_20yd",
+                "sprint_30yd",
+            ],
+            title="Athlete Score vs Physical Potential",
+        )
 
-**Sprint scoring:** lower times are better. The app ranks `10yd`, `20yd`, and `30yd` as inverted percentiles inside the active comparison group and averages the available splits.
+        fig.update_layout(
+            xaxis_title="Athlete Score",
+            yaxis_title="Physical Potential Score",
+            height=650,
+        )
 
-**Aggregation:** best force-plate values and fastest sprint splits are used per player; the latest available profile row is used for height, bodyweight, wingspan, position, and school fields.
+        st.plotly_chart(fig, use_container_width=True)
 
-**Missing values:** scores re-weight automatically using available components. Missing sprint is not treated as zero. Pitchers are labeled `Not expected for pitchers`; non-sprinting position players are labeled `Missing / not tested`.
-        """
+        st.markdown("### Overall Score by Position")
+
+        box_df = chart_df[chart_df["overall_score"].notna()]
+
+        fig2 = px.box(
+            box_df,
+            x="position",
+            y="overall_score",
+            points="all",
+            hover_name="name",
+            title="Overall Score Distribution by Position",
+        )
+
+        fig2.update_layout(
+            xaxis_title="Position",
+            yaxis_title="Overall Score",
+            height=550,
+        )
+
+        st.plotly_chart(fig2, use_container_width=True)
+
+
+with tab_data:
+    st.subheader("Loaded Data Checks")
+
+    st.markdown("### Processed Master Table")
+    st.dataframe(
+        round_display(df),
+        use_container_width=True,
+        hide_index=True,
     )
+
+    st.markdown("### Raw Sprint")
+    st.dataframe(sprint_raw, use_container_width=True, hide_index=True)
+
+    st.markdown("### Raw Anthropometrics")
+    st.dataframe(anthro_raw, use_container_width=True, hide_index=True)
+
+    st.markdown("### Raw Force Plate")
+    st.dataframe(force_raw, use_container_width=True, hide_index=True)
