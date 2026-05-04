@@ -25,7 +25,7 @@ st.set_page_config(
 
 APP_TITLE = "Draft Athletic Qualities + Physical Potential"
 
-DEFAULT_GOOGLE_SHEET_ID = "1J27zw_UngoTNdq6VKPF6RhB8aqfmvlpX60GtrXjOsbs"
+DEFAULT_GOOGLE_SHEET_ID = "1dD_lYX6pOAfioM-esf4G3caNfTzfAbd4"
 
 REQUIRED_TABS = {
     "Sprint": "Sprint",
@@ -73,36 +73,38 @@ def get_sheet_id() -> str:
 
 def get_google_credentials_dict() -> dict:
     """
-    Supports this Streamlit secrets format:
+    Supports any of these Streamlit secrets formats:
 
-    GOOGLE_CREDENTIALS = '''{
-      "type": "service_account",
-      ...
-    }'''
+    GOOGLE_CREDENTIALS = '''{...}'''
 
-    Also supports:
     GOOGLE_SERVICE_ACCOUNT_JSON = '''{...}'''
 
-    Or:
     [gcp_service_account]
     type = "service_account"
     ...
     """
+
     if "GOOGLE_CREDENTIALS" in st.secrets:
         raw = st.secrets["GOOGLE_CREDENTIALS"]
-        return json.loads(raw) if isinstance(raw, str) else dict(raw)
+        creds = json.loads(raw) if isinstance(raw, str) else dict(raw)
 
-    if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
+    elif "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
         raw = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
-        return json.loads(raw) if isinstance(raw, str) else dict(raw)
+        creds = json.loads(raw) if isinstance(raw, str) else dict(raw)
 
-    if "gcp_service_account" in st.secrets:
-        return dict(st.secrets["gcp_service_account"])
+    elif "gcp_service_account" in st.secrets:
+        creds = dict(st.secrets["gcp_service_account"])
 
-    raise RuntimeError(
-        "Missing Google credentials. Add GOOGLE_CREDENTIALS, "
-        "GOOGLE_SERVICE_ACCOUNT_JSON, or [gcp_service_account] to Streamlit secrets."
-    )
+    else:
+        raise RuntimeError(
+            "Missing Google credentials. Add GOOGLE_CREDENTIALS, "
+            "GOOGLE_SERVICE_ACCOUNT_JSON, or [gcp_service_account] to Streamlit secrets."
+        )
+
+    if "private_key" in creds:
+        creds["private_key"] = str(creds["private_key"]).replace("\\n", "\n")
+
+    return creds
 
 
 @st.cache_resource(show_spinner=False)
@@ -144,6 +146,8 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "player_id": [
         "DPL ID",
         "dpl id",
+        "DPLID",
+        "DPL_ID",
         "Player ID",
         "player_id",
         "ID",
@@ -152,31 +156,42 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
         "Full Name",
         "Name",
         "Player",
+        "Player Name",
+        "Athlete",
+        "Athlete Name",
         "About",
         "Full Name Reverse",
     ],
     "first_name": [
         "First Name",
         "GivenName",
+        "Given Name",
     ],
     "last_name": [
         "Last Name",
         "FamilyName",
+        "Family Name",
+        "Surname",
     ],
     "position": [
         "Position",
         "position",
         "POS",
+        "Pos",
+        "Primary Position",
     ],
     "school": [
         "School Name",
         "School",
         "school",
+        "College",
+        "High School",
     ],
     "year": [
         "Year",
         "year",
         "Draft Year",
+        "Class",
     ],
     "height": [
         "Height",
@@ -185,12 +200,16 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
         "Stature Height 1",
         "Stature Height 2",
         "Stature Height 3",
+        "Stature [cm]",
+        "Height [cm]",
+        "Height (cm)",
     ],
     "bodyweight": [
         "Body Weight (kg)",
         "Body Weight [kg]",
         "ForceDecks BW",
         "Weight (kg)",
+        "Weight [kg]",
         "Body Weight",
         "Body Weight 2",
         "Stature Body Weight 1",
@@ -205,12 +224,15 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
         "Stature Arm Span 3",
         "Wingspan",
         "Wing Span",
+        "Armspan",
     ],
     "ci": [
         "Concentric Impulse [Ns]",
         "Concentric Impulse [N s]",
         "Concentric Impulse",
         "Positive Impulse [Ns]",
+        "CMJ Concentric Impulse [Ns]",
+        "CMJ Concentric Impulse [N s]",
     ],
     "mrsi": [
         "RSI-Modified [m/s]",
@@ -221,6 +243,8 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
         "RSI-modified (Imp-Mom) [m/s]",
         "mRSI",
         "MRSI",
+        "RSI Modified",
+        "RSI-modified",
     ],
     "rel_peak_power": [
         "Peak Power / BM [W/kg]",
@@ -229,6 +253,9 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
         "CMJ Max Peak Power [W/kg]",
         "Concentric Peak Power / BM [W/kg]",
         "Takeoff Concentric Peak Power / BM [W/kg]",
+        "Relative Peak Power",
+        "Relative Peak Power [W/kg]",
+        "Peak Power BM",
     ],
     "peak_power": [
         "Peak Power [W]",
@@ -242,6 +269,9 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
         "10 Yard",
         "10-yard",
         "10 Yard Split",
+        "10y",
+        "10 yd split",
+        "10 Yard Dash",
     ],
     "sprint_20yd": [
         "20yd",
@@ -249,6 +279,9 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
         "20 Yard",
         "20-yard",
         "20 Yard Split",
+        "20y",
+        "20 yd split",
+        "20 Yard Dash",
     ],
     "sprint_30yd": [
         "30yd",
@@ -256,6 +289,9 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
         "30 Yard",
         "30-yard",
         "30 Yard Split",
+        "30y",
+        "30 yd split",
+        "30 Yard Dash",
     ],
 }
 
@@ -294,14 +330,30 @@ def text_series(df: pd.DataFrame, canonical_name: str) -> pd.Series:
 def normalize_position(pos: object) -> str:
     text = str(pos).strip().upper()
 
-    if text in ["RHP", "LHP", "P", "HP", "PITCHER"]:
+    if text in ["", "NONE", "NAN", "NULL"]:
+        return ""
+
+    pitcher_values = [
+        "RHP",
+        "LHP",
+        "P",
+        "HP",
+        "PITCHER",
+        "RIGHT HANDED PITCHER",
+        "LEFT HANDED PITCHER",
+    ]
+
+    if text in pitcher_values:
         return "P"
 
     if text in ["C", "1B", "2B", "3B", "SS", "OF", "CF", "LF", "RF"]:
         return text
 
-    if "P" == text:
-        return "P"
+    if text in ["INF", "IF"]:
+        return "INF"
+
+    if text in ["UTL", "UTIL", "UTILITY"]:
+        return "UTIL"
 
     return text
 
@@ -310,14 +362,66 @@ def is_pitcher(pos: object) -> bool:
     return normalize_position(pos) == "P"
 
 
+def clean_name_for_display(name: object) -> str:
+    text = str(name).strip()
+
+    if text.lower() in ["", "none", "nan", "null"]:
+        return ""
+
+    text = re.sub(r"\s+", " ", text)
+
+    return text
+
+
+def normalize_name_key(name: object) -> str:
+    """
+    Converts names into a consistent matching key.
+
+    Handles:
+    - Smith, John
+    - John Smith
+    - JOHN SMITH
+    - John A. Smith
+    - extra spaces
+    - punctuation
+    """
+    text = str(name).strip().lower()
+
+    if text in ["", "none", "nan", "null"]:
+        return ""
+
+    text = re.sub(r"\(.*?\)", " ", text)
+    text = re.sub(r"[^a-z,\s-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if "," in text:
+        parts = [p.strip() for p in text.split(",")]
+        if len(parts) >= 2:
+            last = parts[0]
+            first_part = parts[1]
+            first_tokens = first_part.split()
+            if first_tokens:
+                text = f"{first_tokens[0]} {last}"
+
+    tokens = text.replace("-", " ").split()
+
+    # Drop one-letter middle initials.
+    tokens = [t for t in tokens if len(t) > 1]
+
+    if len(tokens) >= 2:
+        return f"{tokens[0]} {tokens[-1]}"
+
+    return " ".join(tokens)
+
+
 def make_name(df: pd.DataFrame) -> pd.Series:
-    name = text_series(df, "name")
+    name = text_series(df, "name").map(clean_name_for_display)
 
     if name.replace("", np.nan).notna().any():
         return name
 
-    first = text_series(df, "first_name")
-    last = text_series(df, "last_name")
+    first = text_series(df, "first_name").map(clean_name_for_display)
+    last = text_series(df, "last_name").map(clean_name_for_display)
     full = (first + " " + last).str.strip()
 
     return full.replace("", "Unknown")
@@ -331,6 +435,7 @@ def prep_anthro(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame()
     out["player_id"] = text_series(df, "player_id")
     out["name"] = make_name(df)
+    out["name_key"] = out["name"].map(normalize_name_key)
     out["position"] = text_series(df, "position").map(normalize_position)
     out["school"] = text_series(df, "school")
     out["year"] = text_series(df, "year")
@@ -338,25 +443,48 @@ def prep_anthro(df: pd.DataFrame) -> pd.DataFrame:
     out["bodyweight"] = numeric_series(df, "bodyweight")
     out["wingspan"] = numeric_series(df, "wingspan")
 
-    out = out[out["player_id"].astype(str).str.len() > 0]
-    out = out.drop_duplicates(subset=["player_id"], keep="last")
+    out = out[
+        (out["player_id"].astype(str).str.len() > 0)
+        | (out["name_key"].astype(str).str.len() > 0)
+    ]
 
-    return out
+    with_id = out[out["player_id"].astype(str).str.len() > 0].drop_duplicates(
+        subset=["player_id"],
+        keep="last",
+    )
+
+    no_id = out[out["player_id"].astype(str).str.len() == 0].drop_duplicates(
+        subset=["name_key", "position"],
+        keep="last",
+    )
+
+    return pd.concat([with_id, no_id], ignore_index=True)
 
 
-def prep_force_plate(df: pd.DataFrame) -> pd.DataFrame:
+def prep_force_plate(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     out = pd.DataFrame()
     out["player_id"] = text_series(df, "player_id")
+    out["name"] = make_name(df)
+    out["name_key"] = out["name"].map(normalize_name_key)
+    out["position"] = text_series(df, "position").map(normalize_position)
     out["ci"] = numeric_series(df, "ci")
     out["mrsi"] = numeric_series(df, "mrsi")
     out["rel_peak_power"] = numeric_series(df, "rel_peak_power")
     out["peak_power"] = numeric_series(df, "peak_power")
 
-    out = out[out["player_id"].astype(str).str.len() > 0]
+    out = out[
+        (out["player_id"].astype(str).str.len() > 0)
+        | (out["name_key"].astype(str).str.len() > 0)
+    ]
 
-    grouped = (
-        out.groupby("player_id", as_index=False)
+    with_id = out[out["player_id"].astype(str).str.len() > 0]
+
+    force_by_id = (
+        with_id.groupby("player_id", as_index=False)
         .agg(
+            force_name=("name", "last"),
+            force_name_key=("name_key", "last"),
+            force_position=("position", "last"),
             ci=("ci", "max"),
             mrsi=("mrsi", "max"),
             rel_peak_power=("rel_peak_power", "max"),
@@ -364,37 +492,147 @@ def prep_force_plate(df: pd.DataFrame) -> pd.DataFrame:
         )
     )
 
-    return grouped
+    force_by_name = (
+        out[out["name_key"].astype(str).str.len() > 0]
+        .groupby(["name_key", "position"], as_index=False)
+        .agg(
+            force_name=("name", "last"),
+            ci=("ci", "max"),
+            mrsi=("mrsi", "max"),
+            rel_peak_power=("rel_peak_power", "max"),
+            peak_power=("peak_power", "max"),
+        )
+    )
+
+    return force_by_id, force_by_name
 
 
-def prep_sprint(df: pd.DataFrame) -> pd.DataFrame:
+def prep_sprint(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     out = pd.DataFrame()
     out["player_id"] = text_series(df, "player_id")
+    out["name"] = make_name(df)
+    out["name_key"] = out["name"].map(normalize_name_key)
+    out["position"] = text_series(df, "position").map(normalize_position)
     out["sprint_10yd"] = numeric_series(df, "sprint_10yd")
     out["sprint_20yd"] = numeric_series(df, "sprint_20yd")
     out["sprint_30yd"] = numeric_series(df, "sprint_30yd")
 
-    out = out[out["player_id"].astype(str).str.len() > 0]
+    out = out[
+        (out["player_id"].astype(str).str.len() > 0)
+        | (out["name_key"].astype(str).str.len() > 0)
+    ]
 
-    grouped = (
-        out.groupby("player_id", as_index=False)
+    with_id = out[out["player_id"].astype(str).str.len() > 0]
+
+    sprint_by_id = (
+        with_id.groupby("player_id", as_index=False)
         .agg(
+            sprint_name=("name", "last"),
+            sprint_name_key=("name_key", "last"),
+            sprint_position=("position", "last"),
             sprint_10yd=("sprint_10yd", "min"),
             sprint_20yd=("sprint_20yd", "min"),
             sprint_30yd=("sprint_30yd", "min"),
         )
     )
 
-    return grouped
+    sprint_by_name = (
+        out[out["name_key"].astype(str).str.len() > 0]
+        .groupby(["name_key", "position"], as_index=False)
+        .agg(
+            sprint_name=("name", "last"),
+            sprint_10yd=("sprint_10yd", "min"),
+            sprint_20yd=("sprint_20yd", "min"),
+            sprint_30yd=("sprint_30yd", "min"),
+        )
+    )
+
+    return sprint_by_id, sprint_by_name
+
+
+def fill_from_fallback(
+    df: pd.DataFrame,
+    fallback: pd.DataFrame,
+    metrics: List[str],
+    source_label: str,
+) -> pd.DataFrame:
+    """
+    Fill missing values using name_key + position fallback.
+    ID match remains primary.
+    Name match only fills blanks.
+    """
+    if fallback is None or len(fallback) == 0:
+        for metric in metrics:
+            if metric not in df.columns:
+                df[metric] = np.nan
+        return df
+
+    fallback = fallback.copy()
+
+    valid_metrics = [m for m in metrics if m in fallback.columns]
+    merge_cols = ["name_key", "position"] + valid_metrics
+
+    fallback = fallback[merge_cols].drop_duplicates(
+        subset=["name_key", "position"],
+        keep="last",
+    )
+
+    merged = df.merge(
+        fallback,
+        on=["name_key", "position"],
+        how="left",
+        suffixes=("", f"_{source_label}_name_fallback"),
+    )
+
+    for metric in metrics:
+        fallback_col = f"{metric}_{source_label}_name_fallback"
+
+        if metric not in merged.columns:
+            merged[metric] = np.nan
+
+        if fallback_col in merged.columns:
+            merged[metric] = merged[metric].combine_first(merged[fallback_col])
+            merged = merged.drop(columns=[fallback_col])
+
+    return merged
 
 
 def combine_data(
     anthro: pd.DataFrame,
-    force: pd.DataFrame,
-    sprint: pd.DataFrame,
+    force_by_id: pd.DataFrame,
+    force_by_name: pd.DataFrame,
+    sprint_by_id: pd.DataFrame,
+    sprint_by_name: pd.DataFrame,
 ) -> pd.DataFrame:
-    df = anthro.merge(force, on="player_id", how="left")
-    df = df.merge(sprint, on="player_id", how="left")
+    df = anthro.copy()
+
+    # ID-based match first.
+    df = df.merge(force_by_id, on="player_id", how="left")
+    df = df.merge(sprint_by_id, on="player_id", how="left")
+
+    # Name + position fallback second.
+    df = fill_from_fallback(
+        df=df,
+        fallback=force_by_name,
+        metrics=["ci", "mrsi", "rel_peak_power", "peak_power"],
+        source_label="force",
+    )
+
+    df = fill_from_fallback(
+        df=df,
+        fallback=sprint_by_name,
+        metrics=["sprint_10yd", "sprint_20yd", "sprint_30yd"],
+        source_label="sprint",
+    )
+
+    # Borrow position from testing tabs when anthro position is missing.
+    if "force_position" in df.columns:
+        df["position"] = df["position"].replace("", np.nan).combine_first(df["force_position"])
+
+    if "sprint_position" in df.columns:
+        df["position"] = df["position"].replace("", np.nan).combine_first(df["sprint_position"])
+
+    df["position"] = df["position"].map(normalize_position)
 
     sprint_cols = ["sprint_10yd", "sprint_20yd", "sprint_30yd"]
 
@@ -414,6 +652,10 @@ def combine_data(
         ],
         default="Unknown",
     )
+
+    df["matched_anthro_data"] = df[["height", "bodyweight", "wingspan"]].notna().any(axis=1)
+    df["matched_force_data"] = df[["ci", "mrsi", "rel_peak_power", "peak_power"]].notna().any(axis=1)
+    df["matched_sprint_data"] = df[sprint_cols].notna().any(axis=1)
 
     return df
 
@@ -479,8 +721,8 @@ def apply_group_percentiles(df: pd.DataFrame, comparison_mode: str) -> pd.DataFr
     Pitchers are always compared only to pitchers.
 
     Position players can be compared either to:
-      - all position players
-      - same position only
+    - all position players
+    - same position only
     """
     scored_parts = []
 
@@ -504,6 +746,9 @@ def apply_group_percentiles(df: pd.DataFrame, comparison_mode: str) -> pd.DataFr
         group = group.copy()
 
         for metric, higher_is_better in metric_directions.items():
+            if metric not in group.columns:
+                group[metric] = np.nan
+
             group[f"{metric}_pct"] = percentile_score(
                 group[metric],
                 higher_is_better=higher_is_better,
@@ -683,10 +928,17 @@ st.sidebar.caption(f"Google Sheet ID: `{sheet_id}`")
 
 # Process data
 anthro = prep_anthro(anthro_raw)
-force = prep_force_plate(force_raw)
-sprint = prep_sprint(sprint_raw)
+force_by_id, force_by_name = prep_force_plate(force_raw)
+sprint_by_id, sprint_by_name = prep_sprint(sprint_raw)
 
-df = combine_data(anthro, force, sprint)
+df = combine_data(
+    anthro=anthro,
+    force_by_id=force_by_id,
+    force_by_name=force_by_name,
+    sprint_by_id=sprint_by_id,
+    sprint_by_name=sprint_by_name,
+)
+
 df = add_scores(df, comparison_mode=comparison_mode)
 df = add_labels(df)
 
@@ -717,24 +969,27 @@ if search:
         filtered["name"].astype(str).str.lower().str.contains(search, na=False)
         | filtered["player_id"].astype(str).str.lower().str.contains(search, na=False)
         | filtered["school"].astype(str).str.lower().str.contains(search, na=False)
+        | filtered["name_key"].astype(str).str.lower().str.contains(search, na=False)
     ]
 
 
 # KPIs
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 
 c1.metric("Players", f"{len(filtered):,}")
 c2.metric("Pitchers", f"{(filtered['player_type'] == 'Pitcher').sum():,}")
 c3.metric("Position Players", f"{(filtered['player_type'] == 'Position Player').sum():,}")
 c4.metric("Players with Sprint", f"{filtered['has_sprint'].sum():,}")
+c5.metric("Force Matched", f"{filtered['matched_force_data'].sum():,}")
 
 
 # Tabs
-tab_rankings, tab_player, tab_charts, tab_data = st.tabs(
+tab_rankings, tab_player, tab_charts, tab_matching, tab_data = st.tabs(
     [
         "Rankings",
         "Player Profile",
         "Charts",
+        "Matching Check",
         "Raw Data",
     ]
 )
@@ -745,11 +1000,16 @@ with tab_rankings:
 
     ranking_cols = [
         "name",
+        "player_id",
+        "name_key",
         "position",
         "school",
         "player_type",
         "comparison_group",
         "sprint_status",
+        "matched_anthro_data",
+        "matched_force_data",
+        "matched_sprint_data",
         "athlete_score",
         "athlete_grade",
         "physical_potential_score",
@@ -811,20 +1071,35 @@ with tab_player:
 
         c1, c2, c3 = st.columns(3)
 
-        c1.metric("Athlete Score", f"{player['athlete_score']:.1f}" if pd.notna(player["athlete_score"]) else "NA")
-        c2.metric("Physical Potential", f"{player['physical_potential_score']:.1f}" if pd.notna(player["physical_potential_score"]) else "NA")
-        c3.metric("Overall", f"{player['overall_score']:.1f}" if pd.notna(player["overall_score"]) else "NA")
+        c1.metric(
+            "Athlete Score",
+            f"{player['athlete_score']:.1f}" if pd.notna(player["athlete_score"]) else "NA",
+        )
+        c2.metric(
+            "Physical Potential",
+            f"{player['physical_potential_score']:.1f}"
+            if pd.notna(player["physical_potential_score"])
+            else "NA",
+        )
+        c3.metric(
+            "Overall",
+            f"{player['overall_score']:.1f}" if pd.notna(player["overall_score"]) else "NA",
+        )
 
         st.markdown("### Player Info")
 
         info_cols = [
             "name",
             "player_id",
+            "name_key",
             "position",
             "school",
             "player_type",
             "comparison_group",
             "sprint_status",
+            "matched_anthro_data",
+            "matched_force_data",
+            "matched_sprint_data",
         ]
 
         st.dataframe(
@@ -897,6 +1172,9 @@ with tab_charts:
                 "player_type",
                 "comparison_group",
                 "sprint_status",
+                "matched_anthro_data",
+                "matched_force_data",
+                "matched_sprint_data",
                 "ci",
                 "mrsi",
                 "rel_peak_power",
@@ -938,6 +1216,56 @@ with tab_charts:
         )
 
         st.plotly_chart(fig2, use_container_width=True)
+
+
+with tab_matching:
+    st.subheader("Matching Check")
+
+    st.caption(
+        "This tab helps verify whether the app matched anthropometrics, force plate, and sprint data correctly. "
+        "The app matches by DPL ID first, then falls back to cleaned name + position."
+    )
+
+    match_cols = [
+        "name",
+        "player_id",
+        "name_key",
+        "position",
+        "matched_anthro_data",
+        "matched_force_data",
+        "matched_sprint_data",
+        "height",
+        "bodyweight",
+        "wingspan",
+        "ci",
+        "mrsi",
+        "rel_peak_power",
+        "sprint_10yd",
+        "sprint_20yd",
+        "sprint_30yd",
+    ]
+
+    match_cols = [c for c in match_cols if c in df.columns]
+
+    st.markdown("### Players Missing Any Data Source")
+
+    missing_df = df[
+        ~(df["matched_anthro_data"] & df["matched_force_data"] & df["matched_sprint_data"])
+    ].copy()
+
+    st.dataframe(
+        round_display(missing_df[match_cols].sort_values(["name", "position"])),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("### All Matched Data")
+
+    st.dataframe(
+        round_display(df[match_cols].sort_values(["name", "position"])),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 with tab_data:
