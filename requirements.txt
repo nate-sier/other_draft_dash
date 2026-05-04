@@ -4,4 +4,3 @@ numpy>=1.26
 plotly>=5.22
 gspread>=6.1
 google-auth>=2.29
-statsmodels>=0.14
